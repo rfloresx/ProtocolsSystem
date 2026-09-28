@@ -18,11 +18,14 @@ bound to a specific project, the app rebinds it per open project via
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 from protocols_system.core.registry import ProtocolsRegistry
+from protocols_system.protocols.health import IHealthCheck
 from protocols_system.protocols.image_library import (
     AlbumResult,
     AlbumSummary,
@@ -31,6 +34,23 @@ from protocols_system.protocols.image_library import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SubProviderHealth:
+    """Health result for one of the mux's routed sub-providers.
+
+    Attributes:
+        scheme: The URI scheme the sub-provider is bound to (e.g. "immich").
+        ok: True if the sub-provider is reachable, False if it failed, and
+            None if the sub-provider does not support health checks (nothing
+            to verify — treated as healthy in aggregate).
+        detail: A short human-readable status message.
+    """
+
+    scheme: str
+    ok: bool | None
+    detail: str
 
 # Default URI scheme served by each known image provider. The local upload
 # source is bound per-project by the app, so it is not built from config here.
@@ -151,6 +171,72 @@ class MuxImageClient:
                 f"Primary image source '{self._primary}' is not configured"
             )
         return provider
+
+    # ------------------------------------------------------------------
+    # IHealthCheck — verifies each configured sub-provider
+    # ------------------------------------------------------------------
+
+    @property
+    def health_check_url(self) -> str:
+        """Human-readable summary of the configured routes, for display."""
+        if not self._routes:
+            return "(no providers configured)"
+        return ", ".join(f"{scheme}://" for scheme in sorted(self._routes))
+
+    @staticmethod
+    async def _check_one(scheme: str, provider: IImageClient) -> SubProviderHealth:
+        """Run a single sub-provider's health check. Never raises."""
+        if not isinstance(provider, IHealthCheck):
+            return SubProviderHealth(
+                scheme=scheme,
+                ok=None,
+                detail="No health check available",
+            )
+        try:
+            # Enter the async context when the provider defines one, so clients
+            # that create their connection on entry are exercised realistically.
+            if hasattr(provider, "__aenter__"):
+                async with provider:  # type: ignore[attr-defined]
+                    ok = await provider.health_check()
+            else:
+                ok = await provider.health_check()
+        except Exception as exc:  # noqa: BLE001 — a failing sub-provider is a "down" result, not an error
+            logger.debug("Mux: health check raised for scheme '%s': %s", scheme, exc)
+            return SubProviderHealth(scheme=scheme, ok=False, detail=f"Error: {exc}")
+        return SubProviderHealth(
+            scheme=scheme,
+            ok=ok,
+            detail="Reachable" if ok else "Unreachable",
+        )
+
+    async def check_providers(self) -> list[SubProviderHealth]:
+        """Check every configured sub-provider and report per-scheme results.
+
+        Sub-providers are checked concurrently. Providers that do not implement
+        IHealthCheck report ``ok=None`` (nothing to verify). Never raises.
+        """
+        if not self._routes:
+            return []
+        schemes = sorted(self._routes)
+        results = await asyncio.gather(
+            *(self._check_one(scheme, self._routes[scheme]) for scheme in schemes)
+        )
+        return list(results)
+
+    async def health_check(self) -> bool:
+        """Return True only if every health-checkable sub-provider is reachable.
+
+        A mux with no configured providers is considered unhealthy. Providers
+        without a health check do not count against the result. Never raises.
+        """
+        results = await self.check_providers()
+        if not results:
+            return False
+        checkable = [r for r in results if r.ok is not None]
+        if not checkable:
+            # Providers exist but none can be verified — configured but unknown.
+            return True
+        return all(r.ok for r in checkable)
 
     # ------------------------------------------------------------------
     # Byte fetching (URI-scoped — routed by scheme)
