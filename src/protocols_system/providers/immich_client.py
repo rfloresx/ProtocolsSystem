@@ -89,6 +89,26 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
 
 
+# Original formats that browsers and Pillow can display directly.
+_WEB_SAFE_MIME_TYPES = frozenset({
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+})
+
+
+def _looks_like_web_image(data: bytes) -> bool:
+    """Return True if bytes start with a JPEG/PNG/WebP/GIF signature."""
+    return (
+        data[:3] == b"\xff\xd8\xff"
+        or data[:8] == b"\x89PNG\r\n\x1a\n"
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+        or data[:6] in (b"GIF87a", b"GIF89a")
+    )
+
+
 def _map_asset(dto: Any) -> Asset:
     """Convert an immichpy AssetResponseDto to this project's Asset."""
     captured_at = _parse_dt(
@@ -161,6 +181,7 @@ class ImmichClient:
         self._api_key = api_key
         self._cache_size = max(0, cache_size)
         self._byte_cache: dict[str, bytes] = {}
+        self._mime_cache: dict[str, str | None] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -211,12 +232,52 @@ class ImmichClient:
 
     @_retry_policy
     async def get_asset_full(self, asset_id: str) -> bytes:
-        """Return full-resolution original bytes for an asset.
+        """Return full-resolution, display-ready bytes for an asset.
+
+        Web-renderable originals (JPEG/PNG/WebP/GIF) are returned as-is. For
+        anything else (RAW/DNG, HEIC, TIFF, videos) the original can't be
+        shown by browsers or decoded by Pillow, so Immich's server-rendered
+        JPEG is returned instead: the full-size conversion when available,
+        otherwise the preview (for videos, a still frame).
 
         Raises:
             FileNotFoundError: If the asset media does not exist (HTTP 404).
         """
-        return await self._view_asset(asset_id, AssetMediaSize.ORIGINAL, "orig")
+        mime = await self._original_mime(asset_id)
+        if mime is None or mime.lower() in _WEB_SAFE_MIME_TYPES:
+            return await self._view_asset(asset_id, AssetMediaSize.ORIGINAL, "orig")
+
+        logger.debug(
+            "Asset %s original is %s; serving Immich rendition instead", asset_id, mime
+        )
+        try:
+            data = await self._view_asset(asset_id, AssetMediaSize.FULLSIZE, "full")
+            if _looks_like_web_image(data):
+                return data
+        except FileNotFoundError:
+            pass  # Full-size conversion disabled/not generated; use preview.
+        return await self._view_asset(asset_id, AssetMediaSize.PREVIEW, "preview")
+
+    async def _original_mime(self, asset_id: str) -> str | None:
+        """Return the asset's original MIME type (cached), or None if unknown."""
+        if asset_id in self._mime_cache:
+            return self._mime_cache[asset_id]
+        mime: str | None
+        try:
+            async with self._open() as client:
+                dto = await client.assets.get_asset_info(id=UUID(asset_id))
+            mime = getattr(dto, "original_mime_type", None)
+        except NotFoundException as exc:
+            raise FileNotFoundError(
+                f"Immich asset not found (asset_id={asset_id})"
+            ) from exc
+        except (UnauthorizedException, ForbiddenException):
+            raise
+        except Exception:  # noqa: BLE001 — unknown type: fall back to original
+            logger.debug("Could not read MIME type for %s", asset_id, exc_info=True)
+            return None
+        self._mime_cache[asset_id] = mime
+        return mime
 
     @_retry_policy
     async def get_asset_thumbnail(self, asset_id: str) -> bytes:
