@@ -13,11 +13,12 @@ package so provider implementations and the registry live in one place.
 ## Install
 
 ```bash
-# Core only (registry, discovery, protocols)
-pip install protocols-system
+# Core only (registry, discovery, protocols). The importable package is
+# `protocols_system`; the distribution name is `rfx-protocols-system`.
+pip install rfx-protocols-system
 
 # With built-in provider implementations (Immich, Ollama, llama.cpp, Google Places, ...)
-pip install "protocols-system[providers]"
+pip install "rfx-protocols-system[providers]"
 ```
 
 For local development against a checkout:

@@ -1,8 +1,8 @@
 name: Build and Publish Wheel
 
-# Builds the protocols-system wheel and publishes it so the consuming apps
+# Builds the rfx-protocols-system wheel and publishes it so the consuming apps
 # (PhotoStudio, Smart-Albums) can install a versioned artifact
-# (protocols-system==0.2.x) instead of resolving a git SHA — which removes the
+# (rfx-protocols-system==0.2.x) instead of resolving a git SHA — which removes the
 # need for `git` in every consumer Docker image and keeps both consumers
 # locked to the same published version (SIMPLIFICATION 2.2 / 4.2).
 #

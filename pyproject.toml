@@ -1,5 +1,5 @@
 [project]
-name = "protocols-system"
+name = "rfx-protocols-system"
 version = "0.2.0"
 description = "A self-describing, pluggable service locator: decorator-based provider registration, singleton lifecycle management, and introspection-driven GUI discovery."
 readme = "README.md"
