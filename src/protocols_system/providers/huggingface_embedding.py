@@ -142,7 +142,7 @@ class HuggingFaceEmbeddingClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_device(self, torch: "Any") -> str:
+    def _resolve_device(self, torch: Any) -> str:
         """Resolve the configured device string to a concrete torch device.
 
         ``auto`` considers CUDA then Apple's Metal backend (``mps``) then CPU.
@@ -266,7 +266,7 @@ class HuggingFaceEmbeddingClient:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         return self._run_forward([image])[0]
 
-    def _decode_for_batch(self, image_bytes: bytes) -> "PILImage.Image":
+    def _decode_for_batch(self, image_bytes: bytes) -> PILImage.Image:
         """Decode one image, downscaled for the embedding forward pass."""
         from PIL import Image
 
@@ -295,7 +295,7 @@ class HuggingFaceEmbeddingClient:
             chunk_bytes = image_bytes_list[chunk_start : chunk_start + self._batch_size]
 
             indices: list[int] = []
-            images: list["PILImage.Image"] = []
+            images: list[PILImage.Image] = []
             for offset, image_bytes in enumerate(chunk_bytes):
                 idx = chunk_start + offset
                 try:

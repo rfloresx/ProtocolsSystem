@@ -21,9 +21,9 @@ import asyncio
 import json
 import logging
 import mimetypes
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from protocols_system.core.registry import ProtocolsRegistry
@@ -55,10 +55,10 @@ def _to_aware_utc(dt: datetime | None) -> datetime:
     naive and aware timestamps.
     """
     if dt is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=UTC)
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _extract_exif(path: Path) -> dict[str, Any]:
@@ -69,7 +69,8 @@ def _extract_exif(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {}
     try:
         from PIL import Image
-        from PIL.ExifTags import GPS as GPSTags, Base as ExifBase
+        from PIL.ExifTags import GPS as GPSTags  # noqa: N811 — intentional, matches ExifBase
+        from PIL.ExifTags import Base as ExifBase
 
         with Image.open(path) as img:
             exif_data = img.getexif()
@@ -116,7 +117,7 @@ def _extract_exif(path: Path) -> dict[str, Any]:
     return result
 
 
-def _parse_gps_coord(dms: Any, ref: Any) -> Optional[float]:
+def _parse_gps_coord(dms: Any, ref: Any) -> float | None:
     """Convert an EXIF GPS DMS tuple + ref to decimal degrees."""
     if dms is None or ref is None:
         return None
@@ -159,7 +160,7 @@ class LocalImageLibraryClient:
         self._db: dict[str, Any] = {}
         self._dirty: bool = False
 
-    async def __aenter__(self) -> "LocalImageLibraryClient":
+    async def __aenter__(self) -> LocalImageLibraryClient:
         # Index building does an rglob plus a synchronous Pillow EXIF open per
         # file — potentially thousands of blocking filesystem+decode ops. Run
         # it off the event loop so entering the client doesn't stall every
@@ -469,7 +470,7 @@ class LocalImageLibraryClient:
         )
 
     @staticmethod
-    def _parse_dt(value: Any) -> Optional[datetime]:
+    def _parse_dt(value: Any) -> datetime | None:
         """Parse an ISO datetime string or return None."""
         if value is None:
             return None
