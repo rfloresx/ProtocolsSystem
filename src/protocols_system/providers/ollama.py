@@ -1,11 +1,15 @@
 """OllamaClient — async wrapper around the official ollama Python library.
 
-Implements ILLMClient (vision analysis), IEmbeddingClient (image embeddings),
-and IHealthCheck. Uses ollama.AsyncClient for all interactions.
+Implements ILLMClient (vision analysis) and IHealthCheck via ``ollama.AsyncClient``.
+Transient errors (ConnectionError, 5xx) are retried via tenacity with exponential
+backoff.
 
-Transient errors (ConnectionError) are retried with exponential backoff.
+Note: this client does NOT implement image embeddings. Ollama's ``/api/embed``
+endpoint embeds *text*, so handing it image bytes silently produces meaningless
+vectors; ``embed()``/``embed_batch()`` raise ``NotImplementedError``. Use a
+dedicated image-embedding provider ("huggingface", "image_embedding") instead.
 
-Requires: ollama
+Requires: ollama, tenacity
 """
 
 from __future__ import annotations
@@ -14,13 +18,35 @@ import json
 import logging
 from typing import Any
 
+from ollama import AsyncClient, ResponseError
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from protocols_system.core.llm_support import (
+    ImageConversionError,
+    prepare_image_for_vision,
+    validate_against_schema,
+)
 from protocols_system.core.registry import ProtocolsRegistry
-from protocols_system.core.validation import validate_against_schema
 from protocols_system.protocols.embedding import IEmbeddingClient
 from protocols_system.protocols.health import IHealthCheck
 from protocols_system.protocols.llm import ILLMClient
 
 logger = logging.getLogger(__name__)
+
+
+_retry_policy = retry(
+    retry=retry_if_exception_type(ConnectionError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
 
 
 @ProtocolsRegistry.register("ollama", ILLMClient)
@@ -29,8 +55,9 @@ logger = logging.getLogger(__name__)
 class OllamaClient:
     """Async client for the Ollama API using the official ollama library.
 
-    Provides vision-based image analysis (ILLMClient) and image embedding
-    generation (IEmbeddingClient) via a local Ollama server.
+    Provides vision-based image analysis (ILLMClient) via a local Ollama
+    server. The library handles image encoding, JSON format negotiation, and
+    API endpoint routing internally.
 
     Usage::
 
@@ -40,12 +67,14 @@ class OllamaClient:
             embed_model="mxbai-embed-large",
         ) as client:
             result = await client.analyze_image(img, prompt, schema)
-            embedding = await client.embed(img)
 
     Args:
         base_url: The Ollama server URL.
         vision_model: Model ID for vision/LLM tasks.
-        embed_model: Model ID for embedding generation.
+        embed_model: Model ID retained for config/discovery compatibility.
+        timeout: Per-request timeout in seconds. Without a timeout the ollama
+            AsyncClient would wait forever on a stuck model load, hanging the
+            whole pipeline.
     """
 
     def __init__(
@@ -53,11 +82,13 @@ class OllamaClient:
         base_url: str = "http://localhost:11434",
         vision_model: str = "llava:latest",
         embed_model: str = "mxbai-embed-large",
+        timeout: float = 120.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._vision_model = vision_model
         self._embed_model = embed_model
-        self._client: Any = None  # ollama.AsyncClient
+        self._timeout = float(timeout)
+        self._client: AsyncClient | None = None
 
     @property
     def vision_model(self) -> str:
@@ -72,30 +103,27 @@ class OllamaClient:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> OllamaClient:
-        from ollama import AsyncClient
-
-        self._client = AsyncClient(host=self._base_url)
+        self._client = AsyncClient(host=self._base_url, timeout=self._timeout)
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        self._client = None
+        await self.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_client(self) -> Any:
+    def _get_client(self) -> AsyncClient:
         """Return the active client, creating one lazily if needed."""
         if self._client is None:
-            from ollama import AsyncClient
-
-            self._client = AsyncClient(host=self._base_url)
+            self._client = AsyncClient(host=self._base_url, timeout=self._timeout)
         return self._client
 
     # ------------------------------------------------------------------
     # ILLMClient
     # ------------------------------------------------------------------
 
+    @_retry_policy
     async def analyze_image(
         self,
         image_bytes: bytes,
@@ -113,9 +141,15 @@ class OllamaClient:
             Parsed JSON dict on success, or {"error": "..."} on failure.
 
         Raises:
-            ConnectionError: On transient connection errors.
+            ConnectionError: On transient connection errors (retried by tenacity).
         """
-        from ollama import ResponseError
+        # Normalize non-JPEG/PNG formats (HEIC/TIFF/BMP/GIF/WebP) to JPEG
+        # before sending, and fail cleanly if conversion isn't possible
+        # rather than handing the model undecodable bytes.
+        try:
+            prepared_bytes, _mime = prepare_image_for_vision(image_bytes)
+        except ImageConversionError as exc:
+            return {"error": f"Image conversion failed: {exc}"}
 
         try:
             response = await self._get_client().chat(
@@ -124,13 +158,21 @@ class OllamaClient:
                     {
                         "role": "user",
                         "content": prompt,
-                        "images": [image_bytes],
+                        "images": [prepared_bytes],
                     }
                 ],
                 format="json",
                 think=False,
             )
         except ResponseError as exc:
+            # A 5xx usually means the server is still loading the model or is
+            # transiently out of memory — wrap it so tenacity retries. Keep
+            # 4xx (e.g. model not found) permanent.
+            status = getattr(exc, "status_code", None)
+            if status is not None and status >= 500:
+                raise ConnectionError(
+                    f"Ollama server error (HTTP {status}): {exc}"
+                ) from exc
             return {"error": f"Ollama API error: {exc}"}
         except (ConnectionError, OSError, TimeoutError) as exc:
             raise ConnectionError(
@@ -151,61 +193,43 @@ class OllamaClient:
         if validation_error is not None:
             return {"error": f"Schema validation failed: {validation_error}", "raw": parsed}
 
-        return parsed  # type: ignore[no-any-return]
+        result_dict: dict[str, Any] = parsed
+        return result_dict
 
     # ------------------------------------------------------------------
-    # IEmbeddingClient
+    # IEmbeddingClient (unsupported — fails loudly)
     # ------------------------------------------------------------------
 
     async def embed(self, image_bytes: bytes) -> list[float]:
-        """Generate an embedding vector for an image.
+        """Raise: Ollama's ``/api/embed`` endpoint embeds text, not images.
 
-        Args:
-            image_bytes: Raw image bytes.
-
-        Returns:
-            Embedding vector as list of floats.
+        Passing image bytes to it would embed the base64 string *as text* —
+        a well-formed vector with no relationship to the image's visual
+        content, so every downstream cosine comparison would silently operate
+        on noise. Fail loudly instead.
 
         Raises:
-            ConnectionError: If the Ollama server is unreachable.
+            NotImplementedError: Always. Use a dedicated image-embedding
+                provider ("huggingface", "image_embedding").
         """
-        from ollama import ResponseError
-
-        try:
-            response = await self._get_client().embed(
-                model=self._embed_model,
-                input=image_bytes,
-            )
-            return [float(x) for x in response.embeddings[0]]
-        except ResponseError:
-            raise
-        except (ConnectionError, OSError, TimeoutError) as exc:
-            raise ConnectionError(
-                f"Cannot reach Ollama server at {self._base_url}: {exc}"
-            ) from exc
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — passing "
+            "image bytes to it silently produces meaningless vectors rather "
+            "than an error. Use a dedicated image-embedding provider "
+            "(huggingface, image_embedding) instead."
+        )
 
     async def embed_batch(
         self,
         image_bytes_list: list[bytes],
     ) -> list[list[float] | None]:
-        """Compute embeddings for a list of images sequentially.
-
-        Ollama processes one image at a time. Failed images return None.
-
-        Args:
-            image_bytes_list: Raw image bytes for each image.
-
-        Returns:
-            List of embedding vectors or None for failures.
-        """
-        results: list[list[float] | None] = []
-        for image_bytes in image_bytes_list:
-            try:
-                embedding = await self.embed(image_bytes)
-                results.append(embedding)
-            except Exception:
-                results.append(None)
-        return results
+        """Raise: see ``embed()`` — Ollama's embed endpoint doesn't do images."""
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — passing "
+            "image bytes to it silently produces meaningless vectors rather "
+            "than an error. Use a dedicated image-embedding provider "
+            "(huggingface, image_embedding) instead."
+        )
 
     async def close(self) -> None:
         """Release client resources."""
@@ -226,9 +250,9 @@ class OllamaClient:
         Returns:
             True if the server responds successfully, False otherwise.
         """
-        try:
-            import httpx
+        import httpx
 
+        try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self._base_url}/api/tags")
                 return resp.status_code == 200

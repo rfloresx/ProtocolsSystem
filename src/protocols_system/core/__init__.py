@@ -7,9 +7,14 @@ from .discovery import (
     get_provider_schema,
     set_excluded_protocols,
 )
+from .llm_support import (
+    ImageConversionError,
+    detect_mime,
+    prepare_image_for_vision,
+    validate_against_schema,
+)
 from .registry import ProtocolsRegistry
 from .types import ConfigParam, ProtocolSlot
-from .validation import validate_against_schema
 
 __all__ = [
     "ProtocolsRegistry",
@@ -21,4 +26,7 @@ __all__ = [
     "ProtocolSlot",
     "ConfigParam",
     "validate_against_schema",
+    "prepare_image_for_vision",
+    "detect_mime",
+    "ImageConversionError",
 ]

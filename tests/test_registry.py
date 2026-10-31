@@ -149,3 +149,24 @@ class TestReset:
         assert "kept" in ProtocolsRegistry.get_providers(ITestProtocol)
         # Instance cleared
         assert ProtocolsRegistry.get_instance(ITestProtocol) is None
+
+
+class TestRemoveInstance:
+    """remove_instance() drops a single protocol's live singleton."""
+
+    def test_removes_only_the_given_protocol(self):
+        first = object()
+        second = object()
+        ProtocolsRegistry.set_instance(ITestProtocol, first)
+        ProtocolsRegistry.set_instance(ISecondProtocol, second)
+
+        removed = ProtocolsRegistry.remove_instance(ITestProtocol)
+
+        assert removed is first
+        # The targeted protocol is gone...
+        assert ProtocolsRegistry.get_instance(ITestProtocol) is None
+        # ...but the unrelated protocol's instance survives.
+        assert ProtocolsRegistry.get_instance(ISecondProtocol) is second
+
+    def test_returns_none_when_absent(self):
+        assert ProtocolsRegistry.remove_instance(ITestProtocol) is None

@@ -13,12 +13,30 @@ import logging
 from typing import Any
 
 import httpx
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from protocols_system.core.registry import ProtocolsRegistry
 from protocols_system.protocols.embedding import IEmbeddingClient
 from protocols_system.protocols.health import IHealthCheck
 
 logger = logging.getLogger(__name__)
+
+
+_retry_policy = retry(
+    retry=retry_if_exception_type(
+        (httpx.ConnectError, httpx.TimeoutException, ConnectionError)
+    ),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
 
 
 @ProtocolsRegistry.register("image_embedding", IEmbeddingClient)
@@ -87,10 +105,33 @@ class ImageEmbeddingClient:
             )
         return self._client
 
+    def _handle_http_error(self, exc: httpx.HTTPStatusError) -> None:
+        """Raise ConnectionError for 5xx (retryable) or RuntimeError for 4xx.
+
+        Raises:
+            ConnectionError: For 5xx server errors (retried by tenacity).
+            RuntimeError: For 4xx client errors (not retried).
+        """
+        status = exc.response.status_code
+        try:
+            body = exc.response.json()
+            detail = body.get("detail", exc.response.text)
+        except Exception:
+            detail = exc.response.text
+
+        if status >= 500:
+            raise ConnectionError(
+                f"Embedding server error (HTTP {status}): {detail}"
+            ) from exc
+        raise RuntimeError(
+            f"Embedding request failed (HTTP {status}): {detail}"
+        ) from exc
+
     # ------------------------------------------------------------------
     # IEmbeddingClient
     # ------------------------------------------------------------------
 
+    @_retry_policy
     async def embed(self, image_bytes: bytes) -> list[float]:
         """Compute an embedding vector for a single image.
 
@@ -103,8 +144,9 @@ class ImageEmbeddingClient:
             Normalized embedding vector as list of floats.
 
         Raises:
-            ConnectionError: If the server is unreachable or returns 5xx.
-            RuntimeError: If the server returns a 4xx error.
+            ConnectionError: If the server is unreachable or returns 5xx
+                (retried by tenacity).
+            RuntimeError: If the server returns a 4xx error (not retried).
         """
         try:
             response = await self._get_client().post(
@@ -114,22 +156,12 @@ class ImageEmbeddingClient:
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            detail = exc.response.text
-            if status >= 500:
-                raise ConnectionError(
-                    f"Embedding server error (HTTP {status}): {detail}"
-                ) from exc
-            raise RuntimeError(
-                f"Embedding request failed (HTTP {status}): {detail}"
-            ) from exc
-        except httpx.ConnectError as exc:
+            self._handle_http_error(exc)
+        except (httpx.ConnectError, httpx.TimeoutException):
+            raise
+        except httpx.TransportError as exc:
             raise ConnectionError(
                 f"Cannot reach embedding server at {self._base_url}: {exc}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise ConnectionError(
-                f"Timeout connecting to embedding server: {exc}"
             ) from exc
 
         data: dict[str, Any] = response.json()
@@ -141,6 +173,7 @@ class ImageEmbeddingClient:
 
         return [float(x) for x in embedding]
 
+    @_retry_policy
     async def embed_batch(
         self,
         image_bytes_list: list[bytes],

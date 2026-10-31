@@ -151,6 +151,22 @@ class ProtocolsRegistry:
         ProtocolsRegistry._instances[protocol] = instance
 
     @staticmethod
+    def remove_instance(protocol: type) -> Any:
+        """Drop the active singleton for a SINGLE protocol.
+
+        Unlike ``clear_instances()`` (which wipes every protocol's instance),
+        this removes only the one protocol — e.g. clearing the Geo provider
+        without tearing down an unrelated live image mux.
+
+        Args:
+            protocol: The protocol type whose live instance should be removed.
+
+        Returns:
+            The removed instance, or None if no instance was registered.
+        """
+        return ProtocolsRegistry._instances.pop(protocol, None)
+
+    @staticmethod
     def clear_instances() -> None:
         """Clear all live instances. Catalog remains intact."""
         ProtocolsRegistry._instances.clear()

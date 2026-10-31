@@ -1,6 +1,6 @@
 [project]
 name = "protocols-system"
-version = "0.1.0"
+version = "0.2.0"
 description = "A self-describing, pluggable service locator: decorator-based provider registration, singleton lifecycle management, and introspection-driven GUI discovery."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,27 @@ providers = [
     "ollama>=0.4",
     "googlemaps>=4.10",
     "Pillow>=10.0",
+]
+# OpenAI-compatible LLM provider (openai_llm).
+openai = [
+    "openai>=1.0.0,<3",
+]
+# HEIC/HEIF decoding for the vision image-preparation path (pillow-heif).
+# Without it, HEIC input reports a clear error rather than sending
+# undecodable bytes to a vision API.
+heif = [
+    "pillow-heif>=0.16.0,<1",
+]
+# Local CLIP-family image embeddings (huggingface_embedding). Heavy — pulls
+# torch — so kept separate from the core providers extra.
+huggingface = [
+    "transformers>=4.38.0,<5",
+    "torch>=2.0.0",
+]
+# Shared web-auth primitives (protocols_system.webauth): bcrypt hashing and
+# timing-safe verification used by consumer web GUIs.
+webauth = [
+    "bcrypt>=4.0",
 ]
 dev = [
     "pytest>=8.0",
